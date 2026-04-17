@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-chunk_doc.py — helper per la skill doc-translator di Copilot CLI
+chunk_doc.py — helper for the doc-translator Copilot CLI skill
 
-Uso:
-  python3 chunk_doc.py split  --file <path> --level <light|medium|aggressive> [--words N] [--session ID]
-  python3 chunk_doc.py merge  --session <ID> --output <path>
-  python3 chunk_doc.py status --session <ID>
+Commands:
+  split        Clean and split the source document into chunks (stored persistently)
+  next-batch   Return the next N untranslated chunk paths + contents for the agent to translate
+  save-chunk   Save a translated chunk and update session progress
+  merge        Concatenate all translated chunks into the final output file
+  status       Show translation progress for a session
+  list         List all saved sessions
+  update-glossary  Add/update terms in the session glossary
+  load-state   Print the full state of a session as JSON
+
+Session data is stored permanently in:
+  ~/.copilot/doc-translator/sessions/<session_id>/
+    state.json          — session metadata + glossary
+    src_chunk_NNN.txt   — source chunks
+    trl_chunk_NNN.md    — translated chunks
 """
 
 import argparse
@@ -17,38 +28,27 @@ import sys
 import time
 from pathlib import Path
 
+SESSION_ROOT = Path.home() / '.copilot' / 'doc-translator' / 'sessions'
+
 
 # ─── CLEANUP ────────────────────────────────────────────────────────────────
 
 def cleanup_light(text: str) -> str:
-    """Artefatti minimi: sillabazione spezzata, numeri pagina, a capo in eccesso."""
-    # Sillabazione spezzata a fine riga (word-\nword → wordword)
     text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
-    # Numeri di pagina isolati (solo cifre su riga propria)
     text = re.sub(r'(?<!\S)\n[ \t]*\d{1,4}[ \t]*\n(?!\S)', '\n', text)
-    # Riduzione eccesso di righe vuote (>2 → 2)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Spazi/tab finali per riga
     text = re.sub(r'[ \t]+$', '', text, flags=re.MULTILINE)
     return text.strip()
 
 
 def cleanup_medium(text: str) -> str:
-    """Strutturale: light + heading vuoti, liste, header/footer ripetuti."""
     text = cleanup_light(text)
-
-    # Heading vuoti o con soli spazi
     text = re.sub(r'^#{1,6}[ \t]*$', '', text, flags=re.MULTILINE)
-    # Assicura spazio dopo # nei heading
     text = re.sub(r'^(#{1,6})([^ #\n])', r'\1 \2', text, flags=re.MULTILINE)
-
-    # Normalizza bullet con rientri anomali → lista piatta
     text = re.sub(r'^[ \t]{2,}[-*+][ \t]+', '- ', text, flags=re.MULTILINE)
     text = re.sub(r'^[ \t]*[*+][ \t]+', '- ', text, flags=re.MULTILINE)
-
-    # Rimuovi righe che compaiono più di 3 volte (probabile header/footer di pagina)
     lines = text.split('\n')
-    line_counts: dict[str, int] = {}
+    line_counts: dict = {}
     for line in lines:
         stripped = line.strip()
         if stripped:
@@ -58,44 +58,31 @@ def cleanup_medium(text: str) -> str:
         if not line.strip() or line_counts.get(line.strip(), 0) <= 3
     ]
     text = '\n'.join(cleaned)
-
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 def cleanup_aggressive(text: str) -> str:
-    """Aggressivo: medium + OCR, soft-hyphen, caratteri anomali, righe spezzate."""
     text = cleanup_medium(text)
-
-    # Soft hyphen e caratteri invisibili
     text = text.replace('\u00ad', '')
     text = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', text)
-    # Carattere di sostituzione Unicode (OCR)
     text = text.replace('\ufffd', '')
-
-    # Unisci righe brevi spezzate (< 60 char, non terminanti con punteggiatura forte)
-    # Non toccare heading, bullet, righe vuote, code block
     lines = text.split('\n')
-    merged: list[str] = []
+    merged: list = []
     i = 0
     in_code_block = False
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
-
-        # Traccia apertura/chiusura code block
         if stripped.startswith('```'):
             in_code_block = not in_code_block
             merged.append(line)
             i += 1
             continue
-
         if in_code_block:
             merged.append(line)
             i += 1
             continue
-
-        # Non toccare heading, bullet, righe vuote, fine frase
         if (not stripped or
                 stripped.startswith('#') or
                 re.match(r'^[-*+\d]', stripped) or
@@ -103,8 +90,6 @@ def cleanup_aggressive(text: str) -> str:
             merged.append(line)
             i += 1
             continue
-
-        # Unisci con la riga successiva se entrambe brevi e la prossima non è heading/bullet
         if (i + 1 < len(lines)
                 and len(stripped) < 60
                 and lines[i + 1].strip()
@@ -115,7 +100,6 @@ def cleanup_aggressive(text: str) -> str:
         else:
             merged.append(line)
             i += 1
-
     text = '\n'.join(merged)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
@@ -130,16 +114,59 @@ CLEANUP_FUNCS = {
 
 # ─── CHUNKING ────────────────────────────────────────────────────────────────
 
-def split_into_chunks(text: str, max_words: int = 2800) -> list[str]:
-    """
-    Divide il testo in chunk di al massimo max_words parole.
-    Divide preferibilmente ai confini di sezione (# heading) o di paragrafo (\n\n).
-    """
-    # Prima suddivisione per heading di primo livello
-    sections = re.split(r'(?=^# )', text, flags=re.MULTILINE)
+def split_into_chunks(text: str, max_words: int = 2800) -> list:
+    """Split text into <=max_words chunks at natural boundaries."""
 
-    chunks: list[str] = []
-    current_parts: list[str] = []
+    def _sentences(blob: str) -> list:
+        return re.split(r'(?<=[.!?])\s+', blob)
+
+    def _split_blob(blob: str, mw: int) -> list:
+        segs = re.split(r'\n{2,}', blob)
+        if len(segs) == 1:
+            segs = blob.split('\n')
+        if len(segs) == 1:
+            segs = _sentences(blob)
+
+        result: list = []
+        parts: list = []
+        words = 0
+        for seg in segs:
+            pw = len(seg.split())
+            if pw == 0:
+                continue
+            if pw > mw:
+                if parts:
+                    result.append('\n'.join(parts).strip())
+                    parts = []
+                    words = 0
+                for sent in _sentences(seg):
+                    sw = len(sent.split())
+                    if words + sw > mw and parts:
+                        result.append(' '.join(parts).strip())
+                        parts = [sent]
+                        words = sw
+                    else:
+                        parts.append(sent)
+                        words += sw
+            elif words + pw > mw and parts:
+                result.append('\n'.join(parts).strip())
+                parts = [seg]
+                words = pw
+            else:
+                parts.append(seg)
+                words += pw
+        if parts:
+            result.append('\n'.join(parts).strip())
+        return [c for c in result if c.strip()]
+
+    has_headings = bool(re.search(r'^#{1,6} ', text, flags=re.MULTILINE))
+
+    if not has_headings:
+        return _split_blob(text, max_words)
+
+    sections = re.split(r'(?=^# )', text, flags=re.MULTILINE)
+    chunks: list = []
+    current_parts: list = []
     current_words = 0
 
     def flush():
@@ -153,24 +180,10 @@ def split_into_chunks(text: str, max_words: int = 2800) -> list[str]:
         if not section.strip():
             continue
         section_words = len(section.split())
-
         if section_words > max_words:
-            # Sezione grande: spezza per paragrafi
             flush()
-            paragraphs = re.split(r'\n{2,}', section)
-            para_parts: list[str] = []
-            para_words = 0
-            for para in paragraphs:
-                pw = len(para.split())
-                if para_words + pw > max_words and para_parts:
-                    chunks.append('\n\n'.join(para_parts).strip())
-                    para_parts = [para]
-                    para_words = pw
-                else:
-                    para_parts.append(para)
-                    para_words += pw
-            if para_parts:
-                chunks.append('\n\n'.join(para_parts).strip())
+            for sub in _split_blob(section, max_words):
+                chunks.append(sub)
         elif current_words + section_words > max_words:
             flush()
             current_parts.append(section)
@@ -186,80 +199,220 @@ def split_into_chunks(text: str, max_words: int = 2800) -> list[str]:
 # ─── LANGUAGE HINT ───────────────────────────────────────────────────────────
 
 def detect_lang_hint(text: str) -> str:
-    """Euristica leggera per dedurre la lingua sorgente (non sostituisce NLP)."""
     sample = text[:3000].lower()
     scores = {
-        'italiano':    len(re.findall(r'\b(il|la|le|gli|del|della|che|non|con|per|una|sono|questo|nella)\b', sample)),
-        'inglese':     len(re.findall(r'\b(the|and|is|in|of|to|a|an|that|it|with|this|are|was)\b', sample)),
-        'francese':    len(re.findall(r'\b(le|la|les|des|du|un|une|est|dans|qui|sur|pas|par|avec)\b', sample)),
-        'spagnolo':    len(re.findall(r'\b(el|la|los|las|del|en|que|con|por|una|es|se|lo|su)\b', sample)),
-        'tedesco':     len(re.findall(r'\b(der|die|das|den|dem|und|ist|in|von|zu|mit|auf|nicht|für)\b', sample)),
-        'portoghese':  len(re.findall(r'\b(o|a|os|as|do|da|de|em|que|com|uma|para|por|seu)\b', sample)),
+        'italian':     len(re.findall(r'\b(il|la|le|gli|del|della|che|non|con|per|una|sono|questo|nella)\b', sample)),
+        'english':     len(re.findall(r'\b(the|and|is|in|of|to|a|an|that|it|with|this|are|was)\b', sample)),
+        'french':      len(re.findall(r'\b(le|la|les|des|du|un|une|est|dans|qui|sur|pas|par|avec)\b', sample)),
+        'spanish':     len(re.findall(r'\b(el|la|los|las|del|en|que|con|por|una|es|se|lo|su)\b', sample)),
+        'german':      len(re.findall(r'\b(der|die|das|den|dem|und|ist|in|von|zu|mit|auf|nicht|für)\b', sample)),
+        'portuguese':  len(re.findall(r'\b(o|a|os|as|do|da|de|em|que|com|uma|para|por|seu)\b', sample)),
     }
     best_score = max(scores.values())
     if best_score < 5:
-        return 'sconosciuta'
+        return 'unknown'
     return max(scores, key=scores.get)
 
 
-# ─── SPLIT ───────────────────────────────────────────────────────────────────
+# ─── SESSION STATE ───────────────────────────────────────────────────────────
+
+def _session_dir(session_id: str) -> Path:
+    d = SESSION_ROOT / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _state_path(session_id: str) -> Path:
+    return SESSION_ROOT / session_id / 'state.json'
+
+
+def _load_state(session_id: str) -> dict:
+    p = _state_path(session_id)
+    if not p.exists():
+        _fail(f"Session '{session_id}' not found. Run 'split' first.")
+    with open(p) as f:
+        return json.load(f)
+
+
+def _save_state(state: dict) -> None:
+    p = _state_path(state['session_id'])
+    state['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    with open(p, 'w') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _progress(session_id: str) -> tuple:
+    """Returns (done_set, total_count)"""
+    sdir = SESSION_ROOT / session_id
+    src_files = sorted(sdir.glob('src_chunk_*.txt'))
+    total = len(src_files)
+    done = set()
+    for sf in src_files:
+        m = re.search(r'src_chunk_(\d+)\.txt$', sf.name)
+        if m:
+            n = int(m.group(1))
+            trl = sdir / f'trl_chunk_{n:03d}.md'
+            if trl.exists() and trl.stat().st_size > 0:
+                done.add(n)
+    return done, total
+
+
+# ─── COMMANDS ────────────────────────────────────────────────────────────────
 
 def cmd_split(args: argparse.Namespace) -> None:
     file_path = Path(args.file).expanduser().resolve()
     if not file_path.exists():
-        _fail(f"File non trovato: {file_path}")
+        _fail(f"File not found: {file_path}")
 
     text = file_path.read_text(encoding='utf-8', errors='replace')
-
     cleanup_fn = CLEANUP_FUNCS.get(args.level, cleanup_medium)
     text = cleanup_fn(text)
-
     lang_hint = detect_lang_hint(text)
 
     session_id = args.session or f"dtr_{int(time.time())}"
+    sdir = _session_dir(session_id)
     max_words = args.words
 
     chunks = split_into_chunks(text, max_words=max_words)
 
-    chunk_paths: list[str] = []
+    chunk_paths: list = []
     for i, chunk in enumerate(chunks, 1):
-        chunk_file = Path(f'/tmp/doc_trans_{session_id}_src_chunk_{i:03d}.txt')
+        chunk_file = sdir / f'src_chunk_{i:03d}.txt'
         chunk_file.write_text(chunk, encoding='utf-8')
         chunk_paths.append(str(chunk_file))
 
     total_words = sum(len(c.split()) for c in chunks)
 
-    _ok({
-        "session": session_id,
-        "chunks": chunk_paths,
+    # Compute output path
+    src_stem = file_path.stem
+    if file_path.suffix.lower() == '.md':
+        out_name = f"{src_stem}_translated.md"
+    else:
+        out_name = f"{src_stem}.md"
+    output_path = str(file_path.parent / out_name)
+
+    state = {
+        "session_id": session_id,
+        "source_file": str(file_path),
+        "output_path": output_path,
+        "target_lang": args.target_lang or "",
+        "cleanup_level": args.level,
         "chunk_count": len(chunks),
         "total_words": total_words,
-        "lang_hint": lang_hint,
+        "source_lang": lang_hint,
+        "glossary": {},
+        "batch_size": args.batch_size,
+        "created_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+    _save_state(state)
+
+    _ok({
+        "session": session_id,
+        "session_dir": str(sdir),
+        "chunk_count": len(chunks),
+        "total_words": total_words,
+        "source_lang": lang_hint,
+        "output_path": output_path,
         "level": args.level,
         "source_file": str(file_path),
     })
 
 
-# ─── MERGE ───────────────────────────────────────────────────────────────────
+def cmd_next_batch(args: argparse.Namespace) -> None:
+    state = _load_state(args.session)
+    done, total = _progress(args.session)
+    sdir = SESSION_ROOT / args.session
+    batch_size = args.batch_size or state.get('batch_size', 8)
+
+    batch: list = []
+    for i in range(1, total + 1):
+        if i not in done:
+            src = sdir / f'src_chunk_{i:03d}.txt'
+            if src.exists():
+                content = src.read_text(encoding='utf-8')
+                batch.append({
+                    "chunk_number": i,
+                    "src_path": str(src),
+                    "trl_path": str(sdir / f'trl_chunk_{i:03d}.md'),
+                    "word_count": len(content.split()),
+                    "content": content,
+                })
+                if len(batch) >= batch_size:
+                    break
+
+    remaining_after = total - len(done) - len(batch)
+
+    _ok({
+        "session": args.session,
+        "target_lang": state.get('target_lang', ''),
+        "source_lang": state.get('source_lang', ''),
+        "glossary": state.get('glossary', {}),
+        "done": len(done),
+        "total": total,
+        "batch": batch,
+        "remaining_after_batch": remaining_after,
+        "is_complete": remaining_after == 0 and len(batch) == 0,
+    })
+
+
+def cmd_save_chunk(args: argparse.Namespace) -> None:
+    state = _load_state(args.session)
+    sdir = SESSION_ROOT / args.session
+    n = args.chunk
+
+    # Read translated content from stdin or file
+    if args.file:
+        content = Path(args.file).read_text(encoding='utf-8')
+    else:
+        content = sys.stdin.read()
+
+    trl_path = sdir / f'trl_chunk_{n:03d}.md'
+    trl_path.write_text(content.strip(), encoding='utf-8')
+
+    done, total = _progress(args.session)
+    _ok({
+        "saved": str(trl_path),
+        "chunk": n,
+        "done": len(done),
+        "total": total,
+        "remaining": total - len(done),
+    })
+
+
+def cmd_update_glossary(args: argparse.Namespace) -> None:
+    state = _load_state(args.session)
+    new_terms = json.loads(args.terms)
+    state.setdefault('glossary', {}).update(new_terms)
+    _save_state(state)
+    _ok({"glossary": state['glossary'], "terms_count": len(state['glossary'])})
+
 
 def cmd_merge(args: argparse.Namespace) -> None:
-    session_id = args.session
-    output_path = Path(args.output).expanduser().resolve()
+    state = _load_state(args.session)
+    sdir = SESSION_ROOT / args.session
+    output_path = Path(args.output or state['output_path']).expanduser().resolve()
 
-    pattern = f'/tmp/doc_trans_{session_id}_trl_chunk_*.md'
-    trl_files = sorted(glob_module.glob(pattern))
-
+    trl_files = sorted(sdir.glob('trl_chunk_*.md'))
     if not trl_files:
-        _fail(f"Nessun file tradotto trovato per session '{session_id}'. "
-              f"Cerca: {pattern}")
+        _fail(f"No translated chunks found for session '{args.session}'")
 
-    parts: list[str] = []
+    done, total = _progress(args.session)
+    if len(done) < total:
+        print(json.dumps({
+            "warning": f"Only {len(done)}/{total} chunks translated. "
+                       f"Run next-batch to complete before merging.",
+            "done": len(done),
+            "total": total,
+        }, ensure_ascii=False, indent=2))
+
+    parts: list = []
     for f in trl_files:
-        content = Path(f).read_text(encoding='utf-8').strip()
+        content = f.read_text(encoding='utf-8').strip()
         if content:
             parts.append(content)
 
-    merged = '\n\n'.join(parts)
+    merged = '\n\n---\n\n'.join(parts)
     merged = re.sub(r'\n{3,}', '\n\n', merged)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -268,37 +421,76 @@ def cmd_merge(args: argparse.Namespace) -> None:
     _ok({
         "output_path": str(output_path),
         "chunks_merged": len(trl_files),
+        "done": len(done),
+        "total": total,
     })
 
 
-# ─── STATUS ──────────────────────────────────────────────────────────────────
-
 def cmd_status(args: argparse.Namespace) -> None:
-    session_id = args.session
-    src_files = sorted(glob_module.glob(f'/tmp/doc_trans_{session_id}_src_chunk_*.txt'))
-    trl_set = set(glob_module.glob(f'/tmp/doc_trans_{session_id}_trl_chunk_*.md'))
+    state = _load_state(args.session)
+    done, total = _progress(args.session)
+    sdir = SESSION_ROOT / args.session
 
-    status_list: list[dict] = []
-    for sf in src_files:
-        m = re.search(r'_src_chunk_(\d+)\.txt$', sf)
-        if m:
-            n = m.group(1)
-            trl_path = f'/tmp/doc_trans_{session_id}_trl_chunk_{n}.md'
-            status_list.append({
-                "chunk": int(n),
-                "source": sf,
-                "translated_file": trl_path if trl_path in trl_set else None,
-                "done": trl_path in trl_set,
-            })
+    status_list: list = []
+    for i in range(1, total + 1):
+        src = sdir / f'src_chunk_{i:03d}.txt'
+        trl = sdir / f'trl_chunk_{i:03d}.md'
+        status_list.append({
+            "chunk": i,
+            "done": i in done,
+            "src_exists": src.exists(),
+            "trl_exists": trl.exists(),
+        })
 
-    done = sum(1 for s in status_list if s['done'])
     print(json.dumps({
-        "session": session_id,
-        "total_chunks": len(status_list),
-        "done": done,
-        "remaining": len(status_list) - done,
+        "session": args.session,
+        "source_file": state.get('source_file'),
+        "output_path": state.get('output_path'),
+        "target_lang": state.get('target_lang'),
+        "source_lang": state.get('source_lang'),
+        "total_chunks": total,
+        "done": len(done),
+        "remaining": total - len(done),
+        "percent": round(len(done) / total * 100, 1) if total else 0,
+        "is_complete": len(done) == total,
         "chunks": status_list,
     }, ensure_ascii=False, indent=2))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    if not SESSION_ROOT.exists():
+        _ok({"sessions": []})
+        return
+    sessions: list = []
+    for state_file in SESSION_ROOT.glob('*/state.json'):
+        try:
+            with open(state_file) as f:
+                s = json.load(f)
+            sid = s['session_id']
+            done, total = _progress(sid)
+            sessions.append({
+                "session_id": sid,
+                "source_file": s.get('source_file', ''),
+                "target_lang": s.get('target_lang', ''),
+                "done": len(done),
+                "total": total,
+                "percent": round(len(done) / total * 100, 1) if total else 0,
+                "is_complete": len(done) == total,
+                "created_at": s.get('created_at', ''),
+                "updated_at": s.get('updated_at', ''),
+            })
+        except Exception:
+            pass
+    sessions.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
+    _ok({"sessions": sessions})
+
+
+def cmd_load_state(args: argparse.Namespace) -> None:
+    state = _load_state(args.session)
+    done, total = _progress(args.session)
+    state['_progress'] = {"done": len(done), "total": total,
+                          "percent": round(len(done) / total * 100, 1) if total else 0}
+    print(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -316,37 +508,66 @@ def _fail(msg: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='chunk_doc.py — helper per la skill doc-translator'
+        description='chunk_doc.py — helper for the doc-translator Copilot CLI skill'
     )
-    sub = parser.add_subparsers(dest='command', metavar='<comando>')
+    sub = parser.add_subparsers(dest='command', metavar='<command>')
 
     # split
-    p_split = sub.add_parser('split', help='Pulisci e dividi il documento in chunk')
-    p_split.add_argument('--file', required=True, help='Percorso del file .md o .txt')
-    p_split.add_argument('--level', choices=['light', 'medium', 'aggressive'],
-                         default='medium', help='Livello di pulizia artefatti')
-    p_split.add_argument('--words', type=int, default=2800,
-                         help='Parole massime per chunk (default: 2800)')
-    p_split.add_argument('--session', default=None,
-                         help='ID sessione (generato automaticamente se omesso)')
+    p_split = sub.add_parser('split', help='Clean and split document into chunks')
+    p_split.add_argument('--file', required=True)
+    p_split.add_argument('--level', choices=['light', 'medium', 'aggressive'], default='medium')
+    p_split.add_argument('--words', type=int, default=2800)
+    p_split.add_argument('--session', default=None)
+    p_split.add_argument('--target-lang', default=None)
+    p_split.add_argument('--batch-size', type=int, default=8)
+
+    # next-batch
+    p_nb = sub.add_parser('next-batch', help='Get next N untranslated chunks for agent to translate')
+    p_nb.add_argument('--session', required=True)
+    p_nb.add_argument('--batch-size', type=int, default=None)
+
+    # save-chunk
+    p_sc = sub.add_parser('save-chunk', help='Save a translated chunk')
+    p_sc.add_argument('--session', required=True)
+    p_sc.add_argument('--chunk', required=True, type=int)
+    p_sc.add_argument('--file', default=None, help='File with translated content (default: stdin)')
+
+    # update-glossary
+    p_ug = sub.add_parser('update-glossary', help='Add/update glossary terms')
+    p_ug.add_argument('--session', required=True)
+    p_ug.add_argument('--terms', required=True, help='JSON object of {term: translation}')
 
     # merge
-    p_merge = sub.add_parser('merge', help='Unisci i chunk tradotti in un unico file')
-    p_merge.add_argument('--session', required=True, help='ID sessione')
-    p_merge.add_argument('--output', required=True, help='Percorso file di output finale')
+    p_merge = sub.add_parser('merge', help='Merge all translated chunks into final output')
+    p_merge.add_argument('--session', required=True)
+    p_merge.add_argument('--output', default=None)
 
     # status
-    p_status = sub.add_parser('status', help='Mostra lo stato di avanzamento della traduzione')
-    p_status.add_argument('--session', required=True, help='ID sessione')
+    p_status = sub.add_parser('status', help='Show translation progress')
+    p_status.add_argument('--session', required=True)
+
+    # list
+    sub.add_parser('list', help='List all saved sessions')
+
+    # load-state
+    p_ls = sub.add_parser('load-state', help='Print full session state')
+    p_ls.add_argument('--session', required=True)
 
     args = parser.parse_args()
 
-    if args.command == 'split':
-        cmd_split(args)
-    elif args.command == 'merge':
-        cmd_merge(args)
-    elif args.command == 'status':
-        cmd_status(args)
+    dispatch = {
+        'split': cmd_split,
+        'next-batch': cmd_next_batch,
+        'save-chunk': cmd_save_chunk,
+        'update-glossary': cmd_update_glossary,
+        'merge': cmd_merge,
+        'status': cmd_status,
+        'list': cmd_list,
+        'load-state': cmd_load_state,
+    }
+
+    if args.command in dispatch:
+        dispatch[args.command](args)
     else:
         parser.print_help()
         sys.exit(1)

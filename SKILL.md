@@ -250,53 +250,71 @@ Tell the user:
 
 ## Step 4 — Chunk and cleanup
 
-> 📌 **Step 4/9 — Cleaning artifacts and splitting document into chunks...**
+> 📌 **Step 4/9 — Cleaning artifacts and splitting document into chunks (persistent session)...**
 
+First, check for an existing session that can be resumed:
 ```bash
-python3 ~/.copilot/skills/doc-translator/chunk_doc.py split \
-  --file /path/to/converted_file.md \
-  --level <cleanup_level> \
-  --words 2800
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py list
 ```
 
-> Use `--words 2000` for highly expansive language pairs (e.g., German text → other language)
+- If a session exists for the same source file with chunks already done → ask the user:
+  `"Found session <ID> with N/TOTAL chunks done. Resume it? (yes/no)"`
+  - **yes** → set `SESSION_ID` to the existing session, skip to Step 5 (glossary already in state)
+  - **no** → create a new session below
+
+If splitting fresh:
+```bash
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py split \
+  --file <INTERMEDIATE_MD_PATH> \
+  --level <cleanup_level> \
+  --words 2800 \
+  --target-lang "<TARGET_LANGUAGE>" \
+  --batch-size 8
+```
+
+> Use `--words 2000` for highly expansive language pairs (e.g., English → German)
 > or if a chunk translation gets truncated in Step 6.
 
-Read the JSON output. Save `SESSION_ID`, `CHUNK_COUNT`, `TOTAL_WORDS`, `LANG_HINT` in memory.
+Read the JSON output. Save `SESSION_ID`, `CHUNK_COUNT`, `TOTAL_WORDS`, `SOURCE_LANG`, `OUTPUT_PATH` in memory.
 
 Tell the user:
 ```
 ✅ Document split into N chunks (total: X words).
-🌍 Detected source language: <lang_hint>
-🔑 Session ID: <session_id>  ← save this to resume if the process is interrupted
+🌍 Source language detected: <source_lang> → <target_lang>
+🔑 Session ID: <session_id>
+📁 Session saved permanently — safe to close and resume later.
+▶️  This session will translate up to 8 chunks per run. Run the skill again to continue.
 ```
 
 ---
 
 ## Step 5 — Extract initial glossary
 
-> 📌 **Step 5/9 — Extracting terminology glossary from chunk 1...**
+> 📌 **Step 5/9 — Extracting terminology glossary...**
 
+Load the session state to check if a glossary already exists:
 ```bash
-cat /tmp/doc_trans_<SESSION_ID>_src_chunk_001.txt
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py load-state --session <SESSION_ID>
 ```
 
-Analyze the text and build a **glossary** of terms to handle consistently throughout all chunks.
-Include:
+If `glossary` is non-empty (resuming) → use the saved glossary and skip to Step 6.
+
+If starting fresh, read the first chunk:
+```bash
+cat <SESSION_DIR>/src_chunk_001.txt
+```
+
+Build a **glossary** of terms to keep consistent across all chunks. Include:
 - Proper names: people, places, organizations, products, brands
 - Technical terms, acronyms, abbreviations
-- Titles of works, laws, standards, regulations
-- Terms that must remain in the source language (international tech terms, file names, URLs, shell commands)
+- Terms that must stay in the source language (URLs, shell commands, file names, standards)
 - Terms with a domain-specific translation preference
 
-**Internal glossary format** (keep this updated in memory throughout the entire process):
-```
-GLOSSARY:
-- "Abstract Syntax Tree" → keep as-is (technical term)
-- "pipeline" → keep as-is (common English technical term used internationally)
-- "Directive 2001/29/EC" → keep as-is (regulatory reference)
-- "Mario Rossi" → keep as-is (proper name)
-- "deployment" → translate as: "distribuzione" (if target is Italian)
+Save the initial glossary into the session state:
+```bash
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py update-glossary \
+  --session <SESSION_ID> \
+  --terms '{"term1": "translation1", "term2": "keep as-is"}'
 ```
 
 Tell the user:
@@ -306,43 +324,48 @@ Tell the user:
 
 ---
 
-## Step 6 — Translate chunk by chunk
+## Step 6 — Translate chunk by chunk (batch mode)
 
-> 📌 **Step 6/9 — Starting translation (N chunks total)...**
+> 📌 **Step 6/9 — Translating (batch of up to 8 chunks per agent session)...**
 
-Repeat for each chunk from **001** to **NNN**, in order:
-
-### 6a. Check for already-translated chunks (resume support)
+### 6a. Get the next batch of untranslated chunks
 
 ```bash
-python3 ~/.copilot/skills/doc-translator/chunk_doc.py status --session <SESSION_ID>
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py next-batch \
+  --session <SESSION_ID> \
+  --batch-size 8
 ```
 
-For each chunk with `"done": true` → skip it:
-```
-⏭️  Chunk N/TOTAL: already translated — skipping.
-```
+This returns a JSON object with:
+- `batch` — array of chunks to translate (each has `chunk_number`, `src_path`, `trl_path`, `content`)
+- `done` / `total` — progress counts
+- `target_lang`, `source_lang`, `glossary` — loaded from persistent state
+- `remaining_after_batch` — chunks still pending after this batch
+- `is_complete` — true when no chunks remain
 
-### 6b. Read the source chunk
+If `batch` is empty and `is_complete` is true → skip to Step 7 (all done).
 
-```bash
-cat /tmp/doc_trans_<SESSION_ID>_src_chunk_NNN.txt
+Tell the user:
 ```
-
-Announce before translating:
-```
-⏳ Translating chunk N/TOTAL (~X words)...
+⏳ Translating chunks N to M of TOTAL (X chunks remaining after this batch)...
 ```
 
-### 6c. Translate the chunk
+### 6b. For each chunk in the batch
 
-Use this internal prompt (substitute all placeholders before sending):
+For each item in `batch`:
+
+**Announce:**
+```
+⏳ Chunk N/TOTAL (~X words)...
+```
+
+**Translate** using this internal prompt:
 
 ---
-**TRANSLATION PROMPT** (applied internally for each chunk):
+**TRANSLATION PROMPT** (substitute all placeholders before applying):
 
 ```
-You are a professional translator specializing in [DOCUMENT DOMAIN, if detectable from context].
+You are a professional translator specializing in [DOCUMENT DOMAIN, if detectable].
 Translate the following text into [TARGET_LANGUAGE].
 
 RULES:
@@ -352,13 +375,13 @@ RULES:
 3. Do NOT translate terms marked "keep as-is" in the glossary below
 4. Use natural, fluent [TARGET_LANGUAGE] — avoid literal word-for-word translation
 5. Maintain paragraph structure and approximate length
-6. Cleanup level active: [LEVEL] — if you spot remaining artifacts (isolated numbers, truncated
-   lines, anomalous characters, broken words), fix them silently during translation
+6. If you spot remaining PDF/conversion artifacts (isolated numbers, broken words,
+   anomalous characters), silently fix them during translation
 7. After the translated text, if you encounter new technical terms or proper names not in the
-   glossary, list them under "NEW_TERMS:" (one per line, format: "term" → "how to handle it")
+   glossary, list them under "NEW_TERMS:" (one per line, format: "term" → "translation or keep-as-is")
 
-CURRENT GLOSSARY (follow these choices consistently throughout):
-[GLOSSARY]
+CURRENT GLOSSARY:
+[GLOSSARY as key: value pairs]
 
 ---START OF TEXT TO TRANSLATE---
 [CHUNK_CONTENT]
@@ -366,36 +389,56 @@ CURRENT GLOSSARY (follow these choices consistently throughout):
 
 Output format:
 1. The complete translated text in valid Markdown
-2. Optionally: a "NEW_TERMS:" section at the very end with glossary additions
-Do NOT add any introduction, preamble, explanation, or comment outside these two sections.
+2. Optionally: a "NEW_TERMS:" section at the very end
+Do NOT add any preamble, explanation, or comment outside these two sections.
 ```
 
 ---
 
-### 6d. Save the translated chunk as an intermediate file
-
-Write **only the translated text** (exclude the `NEW_TERMS:` section) to:
-
+**Save** the translated text (without the `NEW_TERMS:` section) using:
+```bash
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py save-chunk \
+  --session <SESSION_ID> \
+  --chunk <N> \
+  --file <path_to_tmp_file_with_translation>
 ```
-/tmp/doc_trans_<SESSION_ID>_trl_chunk_NNN.md
+
+Or write directly to `trl_path` from the batch JSON (e.g., `~/.copilot/doc-translator/sessions/<SESSION_ID>/trl_chunk_NNN.md`).
+
+**Update glossary** if the response includes new terms:
+```bash
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py update-glossary \
+  --session <SESSION_ID> \
+  --terms '{"new_term": "translation"}'
 ```
+
+**Confirm:**
+```
+✅ Chunk N/TOTAL translated and saved.
+```
+
+### 6c. End of batch — report and pause if needed
+
+After translating all chunks in the batch:
 
 ```bash
-cat > /tmp/doc_trans_<SESSION_ID>_trl_chunk_NNN.md << 'CHUNK_END'
-[TRANSLATED TEXT HERE]
-CHUNK_END
+python3 ~/.copilot/skills/doc-translator/chunk_doc.py status --session <SESSION_ID>
 ```
 
-### 6e. Update the glossary
-
-If the translation response includes a `NEW_TERMS:` section, add those terms to the internal glossary.
-This ensures consistency for all remaining chunks.
-
-### 6f. Report progress
-
+**If `remaining > 0`** (more chunks to translate):
 ```
-✅ Chunk N/TOTAL translated — saved to /tmp/doc_trans_<SESSION_ID>_trl_chunk_NNN.md
+⏸️  Batch complete: N/TOTAL chunks done (REMAINING remaining).
+   Context limit reached for this session.
+   👉 Run the skill again with the same file to automatically resume from chunk M.
+   Session ID: <SESSION_ID> (saved permanently — no data will be lost)
 ```
+→ **STOP HERE.** Do not proceed to Step 7. The user must re-invoke the skill.
+
+**If `remaining == 0`** (all chunks done):
+```
+✅ All TOTAL chunks translated! Proceeding to merge...
+```
+→ Continue to Step 7.
 
 ---
 
@@ -405,11 +448,14 @@ This ensures consistency for all remaining chunks.
 
 ```bash
 python3 ~/.copilot/skills/doc-translator/chunk_doc.py merge \
-  --session <SESSION_ID> \
-  --output <OUTPUT_PATH>
+  --session <SESSION_ID>
 ```
 
-If `success: false` → read `"error"` and verify all `_trl_chunk_*.md` files exist and are non-empty.
+The `--output` path is optional — if omitted, the path from `state.json` is used automatically.
+
+If `success: false` → read `"error"` and verify all translated chunk files exist and are non-empty.
+
+If `"warning"` is present (not all chunks done) → do NOT merge; tell the user to resume translation first.
 
 Tell the user:
 ```
@@ -420,15 +466,19 @@ Tell the user:
 
 ## Step 8 — Clean up temporary files
 
-> 📌 **Step 8/9 — Removing temporary files...**
+> 📌 **Step 8/9 — Cleaning up...**
 
+The **session directory** (`~/.copilot/doc-translator/sessions/<SESSION_ID>/`) is preserved permanently
+so the session can always be resumed or inspected. Only clean it if the user explicitly asks.
+
+Remove only the intermediate conversion file (if the source was not .md):
 ```bash
-rm -f /tmp/doc_trans_<SESSION_ID>_src_chunk_*.txt
-rm -f /tmp/doc_trans_<SESSION_ID>_trl_chunk_*.md
+rm -f <INTERMEDIATE_MD_PATH>   # only if it was a temp conversion, not the original
 ```
 
 ```
-✅ Temporary files removed.
+✅ Temporary conversion files removed. Session data preserved at:
+   ~/.copilot/doc-translator/sessions/<SESSION_ID>/
 ```
 
 ---
@@ -459,7 +509,7 @@ rm -f /tmp/doc_trans_<SESSION_ID>_trl_chunk_*.md
 | docling / markitdown fails | Scanned PDF, DRM, corrupted file | Try next tool in chain; ask for `.txt` as last resort |
 | Conversion output is empty | Tool extracted no text layer | Try alternative conversion tool |
 | Chunk translation truncated | Chunk too long for model output | Reduce `--words` to 2000 and re-run split with a new `--session` |
-| `merge: No files found` | `/tmp` was cleared or wrong session ID | Cannot recover — re-run split + translation from scratch |
+| `merge: No files found` | Session dir missing or wrong session ID | Run `chunk_doc.py list` to find the correct session ID |
 | Output file already exists | Source was `.md` → `OUTPUT_PATH` = `doc_translated.md` | Normal behavior — warn user before overwriting |
 | Glossary inconsistency | Same term translated differently across chunks | Do a search-and-replace pass on the final output to unify |
 | Chunk already done (resume) | Session was interrupted and restarted | `status` shows completed chunks → auto-skip those with `"done": true` |
