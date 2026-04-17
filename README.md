@@ -32,7 +32,7 @@ Translate README.md to French
 
 - Python 3.8+
 - `docling` or `markitdown` (installed automatically if missing)
-- GitHub Copilot CLI
+- GitHub Copilot CLI , Claude Code or any coding agents CLI
 
 ## Helper script
 
