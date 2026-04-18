@@ -369,6 +369,10 @@ def cmd_save_chunk(args: argparse.Namespace) -> None:
 
     trl_path = sdir / f'trl_chunk_{n:03d}.md'
     trl_path.write_text(content.strip(), encoding='utf-8')
+    size = trl_path.stat().st_size
+    if size < 50:
+        _fail(f"Saved file is only {size} bytes — content appears empty or truncated. "
+              f"Re-translate chunk {n} and try again.")
 
     done, total = _progress(args.session)
     _ok({
@@ -380,7 +384,85 @@ def cmd_save_chunk(args: argparse.Namespace) -> None:
     })
 
 
-def cmd_update_glossary(args: argparse.Namespace) -> None:
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Scan all chunks in a session and report missing/empty ones."""
+    sdir = SESSION_ROOT / args.session
+    if not sdir.exists():
+        _fail(f"Session '{args.session}' not found")
+
+    state = _load_state(args.session)
+    total = state.get('total_chunks', 0)
+    min_bytes = getattr(args, 'min_bytes', 50)
+
+    missing, empty, done = [], [], []
+    for n in range(1, total + 1):
+        p = sdir / f'trl_chunk_{n:03d}.md'
+        if not p.exists():
+            missing.append(n)
+        elif p.stat().st_size < min_bytes:
+            empty.append(n)
+        else:
+            done.append(n)
+
+    problem_chunks = missing + empty
+    _ok({
+        "all_complete": len(problem_chunks) == 0,
+        "total": total,
+        "done_count": len(done),
+        "missing": missing,
+        "empty": empty,
+        "problem_chunks": problem_chunks,
+    })
+
+
+def cmd_split_for_upload(args: argparse.Namespace) -> None:
+    """Split a file into parts ≤ max_bytes, snapping at newline boundaries."""
+    import math
+    src = Path(args.file).expanduser().resolve()
+    if not src.exists():
+        _fail(f"File not found: {src}")
+
+    max_bytes = getattr(args, 'max_bytes', 244000)
+    output_dir = Path(getattr(args, 'output_dir', '/tmp')).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = getattr(args, 'prefix', src.stem)
+
+    data = src.read_bytes()
+    total_size = len(data)
+    parts = []
+    offset = 0
+    part_num = 1
+
+    while offset < total_size:
+        end = min(offset + max_bytes, total_size)
+        if end < total_size:
+            # Snap to the last newline in the second half of the chunk
+            midpoint = offset + max_bytes // 2
+            last_nl = data.rfind(b'\n', midpoint, end)
+            if last_nl != -1:
+                end = last_nl + 1  # include the newline
+
+        chunk_data = data[offset:end]
+        out_path = output_dir / f'{prefix}_{part_num:02d}.md'
+        out_path.write_bytes(chunk_data)
+        parts.append({
+            "part": part_num,
+            "file": str(out_path),
+            "size_bytes": len(chunk_data),
+        })
+        offset = end
+        part_num += 1
+
+    _ok({
+        "source": str(src),
+        "total_parts": len(parts),
+        "total_bytes": total_size,
+        "max_bytes_per_part": max_bytes,
+        "parts": parts,
+    })
+
+
+
     state = _load_state(args.session)
     new_terms = json.loads(args.terms)
     state.setdefault('glossary', {}).update(new_terms)
